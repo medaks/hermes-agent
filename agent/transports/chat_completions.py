@@ -797,6 +797,14 @@ class ChatCompletionsTransport(ProviderTransport):
         # so keep them apart in provider_data rather than merging.
         reasoning = getattr(msg, "reasoning", None)
         reasoning_content = getattr(msg, "reasoning_content", None)
+        # vLLM and other non-standard providers may emit reasoning as a
+        # top-level `reasoning` field that the OpenAI SDK parks in
+        # `model_extra` rather than exposing as a Pydantic attribute.
+        # Apply the same fallback used for `reasoning_content`.
+        if reasoning is None and hasattr(msg, "model_extra"):
+            model_extra = getattr(msg, "model_extra", None) or {}
+            if isinstance(model_extra, dict) and "reasoning" in model_extra:
+                reasoning = model_extra["reasoning"]
         if reasoning_content is None and hasattr(msg, "model_extra"):
             model_extra = getattr(msg, "model_extra", None) or {}
             if isinstance(model_extra, dict) and "reasoning_content" in model_extra:

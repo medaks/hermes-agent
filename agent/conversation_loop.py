@@ -1360,6 +1360,8 @@ def run_conversation(
     _last_preflight_pressure: Optional[int] = None
     _preflight_compression_blocked = _ctx.preflight_compression_blocked
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
+    # o2-only: consecutive finish_reason='length' hits before giving up.
+    _max_output_hit = 0
     # Last composed answer intentionally held back by a verification gate. If
     # that continuation consumes the remaining budget, this is the best
     # user-facing result available; it must not be confused with error or
@@ -1429,6 +1431,16 @@ def run_conversation(
         api_call_count += 1
         agent._api_call_count = api_call_count
         agent._touch_activity(f"starting API call #{api_call_count}")
+
+        # o2-only: per-iteration logging for observability.
+        if agent.model == "o2":
+            logger.info(
+                "Loop iteration: session=%s model=%s iteration=%d/%d "
+                "messages_in=%d remaining_budget=%d",
+                agent.session_id or "none", agent.model, api_call_count,
+                agent.max_iterations, len(messages),
+                agent.iteration_budget.remaining if agent.iteration_budget else 0,
+            )
 
         # Grace call: the budget is exhausted but we gave the model one
         # more chance.  Consume the grace flag so the loop exits after
@@ -3091,6 +3103,55 @@ def run_conversation(
                                 _continue_content = _get_continuation_prompt(
                                     _is_partial_stream_stub, _dropped_tools
                                 )
+
+                                # o2-only: log truncated output, count consecutive
+                                # length hits, and stop after 3 to avoid burning
+                                # the budget on a model stuck at the output cap.
+                                if agent.model == "o2":
+                                    _truncated_text = ""
+                                    if assistant_message is not None:
+                                        _truncated_text = getattr(assistant_message, "content", None) or ""
+                                    if _truncated_text:
+                                        _display_text = _truncated_text[:5000]
+                                        if len(_truncated_text) > 5000:
+                                            _display_text += (
+                                                "\n\n[... truncated, first 5000 of "
+                                                + str(len(_truncated_text))
+                                                + " chars shown ...]"
+                                            )
+                                        logger.info(
+                                            "\n\n\n"
+                                            f"{agent.log_prefix}⚠️  Response truncated (finish_reason='length') - model hit max output tokens\n"
+                                            f"{agent.log_prefix}   First 5000 chars of output:\n"
+                                            f"{agent.log_prefix}   {'─' * 60}\n"
+                                            f"{agent.log_prefix}   {_display_text}\n"
+                                            f"{agent.log_prefix}   {'─' * 60}"
+                                        )
+
+                                    _max_output_hit += 1
+                                    if _max_output_hit >= 3:
+                                        _turn_exit_reason = f"max_output_truncation_stopped(hits={_max_output_hit})"
+                                        logger.info(
+                                            "\n\n\n"
+                                            f"{agent.log_prefix}❌ Model hit output length limit {_max_output_hit} consecutive times — stopping."
+                                        )
+                                        agent._cleanup_task_resources(effective_task_id)
+                                        agent._persist_session(messages, conversation_history)
+                                        return {
+                                            "final_response": None,
+                                            "messages": messages,
+                                            "api_calls": api_call_count,
+                                            "completed": False,
+                                            "partial": True,
+                                            "error": f"Model hit output length limit {_max_output_hit} consecutive times — stopping",
+                                        }
+
+                                    # Inject "think in small steps" as a user message
+                                    messages.append({
+                                        "role": "user",
+                                        "content": "[System: think in small steps]",
+                                    })
+
                                 continue_msg = {
                                     "role": "user",
                                     "content": _continue_content,
@@ -6343,6 +6404,38 @@ def run_conversation(
                     failed = True
                     break
 
+                # o2-only: tool-call logging and periodic nudge.
+                if agent.model == "o2":
+                    _tool_names = [tc.function.name for tc in assistant_message.tool_calls]
+                    logger.info(
+                        "Tool calls: session=%s iteration=%d tools=%s",
+                        agent.session_id or "none", api_call_count, _tool_names,
+                    )
+
+                    # Periodic nudge: if tool calls since last user message is a
+                    # multiple of 31, inject a reminder into the conversation.
+                    agent._tool_calls_since_user = getattr(agent, "_tool_calls_since_user", 0) + 1
+                    if agent._tool_calls_since_user % 31 == 0:
+                        messages.append({
+                            "role": "user",
+                            "content": "You have made many tool calls since the last user message. If you are stuck, reconsider your approach. The context will auto-compress when needed or you can decide to compress yourself."
+                        })
+                        print(f"{agent.log_prefix}🔔 Periodic nudge: tool_calls_since_user={agent._tool_calls_since_user}")
+
+                    # Log tool results summary.
+                    _last_tool_results = []
+                    for _m in reversed(messages):
+                        if not isinstance(_m, dict) or _m.get("role") != "tool":
+                            break
+                        _last_tool_results.append(
+                            f"{_m.get('name', '?')}:{len(str(_m.get('content', '')))}chars"
+                        )
+                    if _last_tool_results:
+                        logger.info(
+                            "Tool results: session=%s iteration=%d results=%s",
+                            agent.session_id or "none", api_call_count, _last_tool_results,
+                        )
+
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
                     _turn_exit_reason = "guardrail_halt"
@@ -6370,6 +6463,10 @@ def run_conversation(
                 # execution so a single truncation doesn't poison the
                 # entire conversation.
                 truncated_tool_call_retries = 0
+                # o2-only: reset consecutive-length-hit counter on successful
+                # tool execution.
+                if agent.model == "o2":
+                    _max_output_hit = 0
 
                 # Signal that a paragraph break is needed before the next
                 # streamed text.  We don't emit it immediately because
@@ -6462,6 +6559,17 @@ def run_conversation(
                         conversation_history = conversation_history_after_compression(
                             agent, messages, conversation_history
                         )
+                        # o2-only: prevent re-triggering compression on the next
+                        # tool-execution iteration. ``last_prompt_tokens`` still
+                        # holds the pre-compression value from the previous API
+                        # call; without this the next iteration reads the same
+                        # stale value, fires ``should_compress`` again, and loops
+                        # forever. Set to -1 so the next tool-execution path falls
+                        # through to the rough estimate branch (``_real_tokens = 0``),
+                        # which avoids triggering compression until the next API
+                        # call's usage data arrives.
+                        if agent.model == "o2":
+                            _compressor.last_prompt_tokens = -1
                 elif agent.compression_enabled:
                     # Over threshold but compression is blocked (summary-LLM
                     # cooldown or anti-thrashing). Surface a deduped warning so
@@ -6926,6 +7034,10 @@ def run_conversation(
                     final_response = "".join(truncated_response_parts) + final_response
                     truncated_response_parts = []
                     length_continue_retries = 0
+                    # o2-only: a successful continuation resets the consecutive
+                    # length-hit counter.
+                    if agent.model == "o2":
+                        _max_output_hit = 0
                 
                 final_response = agent._strip_think_blocks(final_response).strip()
                 

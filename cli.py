@@ -12173,6 +12173,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 return
             self._voice_recording = True
 
+        # VM audio stack: the wake-word listener holds the ONLY fed loopback
+        # capture substream (hw:1,1 sub0 — the relay plays the laptop mic into
+        # hw:1,0 sub0, cross-connected to hw:1,1 sub0). If it stays armed, any
+        # recording opened via the default input lands on sub1 and captures
+        # pure silence (peak RMS=0). Pause the listener for EVERY recording —
+        # wake-triggered OR manual Ctrl+B — so the recorder takes sub0 and
+        # hears the mic; the wake watchdog resumes it once the turn is idle.
+        if getattr(self, "_wake_word_active", False):
+            try:
+                from tools.wake_word import pause_listening
+                if pause_listening(owner=self):
+                    self._wake_suspended = True
+            except Exception:
+                pass
+
         # Load silence detection params from config. Shape-safe: a
         # hand-edited ``voice: true`` / ``voice: cmd+b`` leaves
         # ``load_config()['voice']`` as a non-dict; coerce to {} so
@@ -12493,12 +12508,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             if not tts_text:
                 return
 
-            # Use MP3 output for CLI playback (afplay doesn't handle OGG well).
-            # The TTS tool may auto-convert MP3->OGG, but the original MP3 remains.
+            # Use WAV output for CLI playback so play_audio_file takes the
+            # sounddevice path (plug-resampled to the loopback's 16 kHz).
+            # MP3 forces the system-player fallback, which opens the loopback
+            # at the file's native rate and attenuates the voice ~17x
+            # (measured: outbound peak 392 vs 6735). The TTS tool aligns the
+            # extension with the provider's output_format.
             os.makedirs(os.path.join(tempfile.gettempdir(), "hermes_voice"), exist_ok=True)
             mp3_path = os.path.join(
                 tempfile.gettempdir(), "hermes_voice",
-                f"tts_{time.strftime('%Y%m%d_%H%M%S')}.mp3",
+                f"tts_{time.strftime('%Y%m%d_%H%M%S')}.wav",
             )
 
             raw_result = text_to_speech_tool(text=tts_text, output_path=mp3_path)
@@ -12967,6 +12986,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # VAD auto-stop transcribes and queues the transcript for process_loop.
         with self._voice_lock:
             self._voice_mode = True
+            # Mirror /voice on: honor voice.auto_tts so a wake-triggered turn
+            # also gets spoken output without a manual /voice on first.
+            try:
+                from hermes_cli.config import load_config
+                _raw_voice = load_config().get("voice")
+                voice_config = _raw_voice if isinstance(_raw_voice, dict) else {}
+                if voice_config.get("auto_tts", False):
+                    self._voice_tts = True
+            except Exception:
+                pass
         self._voice_continuous = False
         try:
             self._voice_start_recording()
@@ -13843,7 +13872,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         stream_tts_to_speaker,
                     )
                     _import_sounddevice()
-                    use_streaming_tts = check_tts_requirements()
+                    # speak_final_only: skip the streaming TTS feed entirely.
+                    # Streaming speaks every assistant message as it is
+                    # generated (including preliminary answers before tool
+                    # calls). When only the final answer should be spoken,
+                    # fall through to the non-streaming path below, which
+                    # speaks the turn's final response once, in full.
+                    _sfo_cfg: dict = {}
+                    try:
+                        from hermes_cli.config import load_config
+                        _sfo_raw = load_config().get("voice")
+                        _sfo_cfg = _sfo_raw if isinstance(_sfo_raw, dict) else {}
+                    except Exception:
+                        pass
+                    if not _sfo_cfg.get("speak_final_only", False):
+                        use_streaming_tts = check_tts_requirements()
                 except Exception:
                     pass
 
@@ -13897,7 +13940,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             if voice_input and isinstance(message, str):
                 _voice_prefix = (
                     "[Voice input — respond concisely and conversationally, "
-                    "2-3 sentences max. No code blocks or markdown.] "
+                    "1 word is fine. 2-3 sentences max. No code blocks or markdown.] "
                 )
 
             def run_agent():

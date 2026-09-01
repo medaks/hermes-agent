@@ -3218,8 +3218,23 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             if hasattr(chunk, "model") and chunk.model:
                 model_name = chunk.model
 
-            # Accumulate reasoning content
-            reasoning_text = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+            # Accumulate reasoning content.
+            # Some providers (e.g. vLLM with reasoning models) emit reasoning
+            # deltas as a non-standard top-level `reasoning` field. The OpenAI
+            # Python SDK's strict Pydantic model places such non-standard
+            # fields into `model_extra` rather than exposing them as attributes,
+            # so `getattr(delta, "reasoning")` returns None and the reasoning
+            # stream is silently dropped — yielding empty responses and a retry
+            # loop that stalls the agent. Fall back to `model_extra` to capture
+            # those deltas without breaking standard providers.
+            reasoning_text = (
+                getattr(delta, "reasoning_content", None)
+                or getattr(delta, "reasoning", None)
+            )
+            if reasoning_text is None and delta is not None:
+                extra = getattr(delta, "model_extra", None)
+                if isinstance(extra, dict):
+                    reasoning_text = extra.get("reasoning") or extra.get("reasoning_content")
             if reasoning_text:
                 reasoning_parts.append(reasoning_text)
                 _fire_first_delta()

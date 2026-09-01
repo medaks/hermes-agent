@@ -64,6 +64,92 @@ _SILENCE_PEAK = 10
 _SILENCE_ALERT_SECONDS = 10
 
 
+# ---------------------------------------------------------------------------
+# Speaker-verification gate (voice-keyed wake word)
+# ---------------------------------------------------------------------------
+# A custom openWakeWord phrase model is trained voice-invariant (many voices)
+# so it fires on the phrase in ANY voice — the only way to keep false-fires low.
+# To honor "only my voice," the openWakeWord engine additionally runs a
+# speaker-verification gate: on a phrase fire it takes the last ~1.5 s of
+# buffered audio, computes a resemblyzer d-vector, and compares it to enrolled
+# reference embeddings. The wake only fires when the speaker is confirmed.
+#
+# The gate runs as a subprocess (the resemblyzer/torch stack lives in the `oc`
+# conda env, not the Hermes venv) so the always-on wake loop stays lean and the
+# venv is untouched. It is fail-closed: any gate error means "no fire."
+#
+# A one-shot gate subprocess re-imports torch + resemblyzer and re-loads the
+# voice encoder on every fire (~1.75 s of cold-start — the d-vector itself is
+# ~7 ms). To keep the wake snappy, the engine instead keeps ONE persistent
+# worker (speaker_gate_worker.py) alive with the encoder loaded once; each fire
+# pipes the audio in and reads the verdict back (~10 ms). If the worker is
+# unavailable or dies, the gate transparently falls back to the one-shot
+# subprocess. Either way the verdict is fail-closed.
+_GATE_DEFAULTS: Dict[str, Any] = {
+    "enabled": False,
+    # Path to speaker_gate.py (reads a 16 kHz mono int16 WAV from stdin,
+    # prints a JSON verdict). Lives in the wakeword project dir.
+    "gate_script": "/home/o/.hermes/projects/2026-08-17-wakeword/speaker_gate.py",
+    # Persistent gate worker (newline-delimited JSON; encoder loaded once, so a
+    # fire is ~10 ms instead of a ~1.75 s cold subprocess). Used when available.
+    "worker_script": "/home/o/.hermes/projects/2026-08-17-wakeword/speaker_gate_worker.py",
+    # Interpreter that has resemblyzer + torch (the `oc` conda env).
+    "python": "/home/o/.conda/envs/oc/bin/python",
+    # Enrolled-voice reference audio (16 kHz mono WAV). A d-vector cosine
+    # >= threshold against ANY reference passes.
+    "refs": ["/home/o/.hermes/projects/2026-08-17-wakeword/enrolled_ref.wav"],
+    # Validated: enrolled user's ~1.2 s "silicon dust" clips score >= 0.549,
+    # stranger-voice "silicon dust" clips score <= 0.460. 0.50 sits between.
+    "threshold": 0.50,
+    # How many seconds of recent audio to keep for the gate (the phrase is
+    # ~1.2 s; 1.5 s captures it with margin).
+    "lookback_seconds": 1.5,
+}
+
+
+def _speaker_gate_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    raw = cfg.get("speaker_gate")
+    sub: Dict[str, Any] = raw if isinstance(raw, dict) else {}
+    out = dict(_GATE_DEFAULTS)
+    for k in _GATE_DEFAULTS:
+        if k in sub and sub[k] is not None:
+            out[k] = sub[k]
+    return out
+
+
+def _speaker_gate_enabled(cfg: Dict[str, Any]) -> bool:
+    return bool(_speaker_gate_cfg(cfg).get("enabled"))
+
+
+def _speaker_gate_status(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Report the speaker-verification gate state for /wake status.
+
+    ``available`` is False when the gate is enabled but its script or a
+    reference file is missing — in which case the gate fails closed and the
+    wake word will never fire, so the user must be told why.
+    """
+    g = _speaker_gate_cfg(cfg)
+    if not g.get("enabled"):
+        return {"enabled": False, "available": True, "hint": ""}
+    missing = []
+    if not os.path.exists(str(g.get("gate_script") or "")):
+        missing.append("gate_script")
+    for r in g.get("refs") or []:
+        if not os.path.exists(str(r)):
+            missing.append(str(r))
+    if missing:
+        return {
+            "enabled": True,
+            "available": False,
+            "hint": "Speaker gate enabled but missing: " + ", ".join(missing),
+        }
+    return {
+        "enabled": True,
+        "available": True,
+        "hint": f"Speaker gate on (threshold {g.get('threshold')}).",
+    }
+
+
 class WakeWordInUse(RuntimeError):
     """Raised when another surface or process owns the wake-word listener."""
 
@@ -488,7 +574,195 @@ class _OpenWakeWordEngine(_Engine):
         self._model = Model(wakeword_models=models, inference_framework=framework)
         self._labels = list(self._model.models.keys())
 
+        # Speaker-verification gate (voice-keyed). Fail-closed, disabled by
+        # default. When enabled, a rolling buffer of recent audio is kept and,
+        # on a phrase fire, the resemblyzer gate confirms the speaker before the
+        # wake actually fires. The gate runs as a subprocess (its resemblyzer +
+        # torch stack lives in the `oc` conda env, not this venv), so the
+        # always-on loop stays lean and the venv is untouched.
+        self._gate = _speaker_gate_cfg(cfg)
+        self._gate_enabled = bool(self._gate.get("enabled"))
+        # Persistent gate worker (lazy-spawned on first fire; see
+        # _speaker_gate_pass). A one-shot subprocess costs ~1.75 s of cold-start
+        # per fire; a resident worker with the encoder pre-loaded is ~10 ms.
+        self._gate_worker: Optional["subprocess.Popen[bytes]"] = None
+        self._gate_worker_lock = threading.Lock()
+        from collections import deque
+
+        lookback = int(float(self._gate.get("lookback_seconds", 1.5)) * SAMPLE_RATE)
+        self._gate_buf: "deque[Any]" = deque(maxlen=max(1, lookback // self.frame_length))
+        # Pre-spawn the gate worker so the FIRST fire is also fast. The worker
+        # loads the encoder in the background; by the time the user says the
+        # phrase it is warm. Non-blocking and best-effort — a failed spawn is
+        # harmless (the lazy path + one-shot fallback in _gate_verdict_worker
+        # handle it). The worker self-terminates on parent death (stdin EOF)
+        # and is torn down in close().
+        if self._gate_enabled:
+            self._prewarm_gate_worker()
+
+    def _speaker_gate_pass(self) -> bool:
+        """Run the speaker-verification gate on the buffered audio. Fail-closed.
+
+        Takes the last ~lookback seconds of captured audio, encodes it as a 16
+        kHz mono int16 WAV, and asks the gate for a verdict. The gate prefers a
+        persistent worker (encoder pre-loaded, ~10 ms) and falls back to a
+        one-shot subprocess (~1.75 s cold-start) if the worker is unavailable.
+        Returns True only when the enrolled speaker is confirmed; any error,
+        missing file, or timeout means "no fire".
+        """
+        import io
+        import wave
+
+        import numpy as np
+
+        try:
+            frames = list(self._gate_buf)
+            if not frames:
+                return False
+            audio = np.concatenate([np.asarray(f, dtype=np.int16) for f in frames])
+            buf = io.BytesIO()
+            with wave.open(buf, "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(SAMPLE_RATE)
+                w.writeframes(audio.tobytes())
+            wav_bytes = buf.getvalue()
+            verdict = self._gate_verdict_worker(wav_bytes)
+            if verdict is None:  # worker unavailable — fall back to one-shot
+                verdict = self._gate_verdict_oneshot(wav_bytes)
+            if not verdict.get("pass"):
+                if verdict.get("error"):
+                    logger.warning("wake word: speaker gate error: %s", verdict["error"])
+                return False
+            logger.info("wake word: speaker gate passed (sim=%.3f)", verdict.get("sim", -1.0))
+            return True
+        except Exception as e:  # noqa: BLE001 - gate must never crash the wake loop
+            logger.warning("wake word: speaker gate failed (fail-closed): %s", e)
+            return False
+
+    def _gate_worker_cmd(self) -> Optional[list]:
+        """Command to spawn the persistent gate worker, or None if unavailable."""
+        worker = str(self._gate.get("worker_script") or "").strip()
+        python = str(self._gate.get("python") or "").strip()
+        refs = [str(r) for r in (self._gate.get("refs") or [])]
+        if not (worker and python and refs):
+            return None
+        if not (os.path.exists(worker) and os.path.exists(python)
+                and all(os.path.exists(r) for r in refs)):
+            return None
+        return [python, worker, "--refs", *refs]
+
+    def _prewarm_gate_worker(self) -> None:
+        """Spawn the gate worker now (at engine build) so the first fire is fast.
+
+        Best-effort and non-blocking: any failure just leaves the worker unset,
+        in which case the first fire lazily spawns it (and falls back to the
+        one-shot subprocess if that also fails).
+        """
+        import subprocess
+
+        with self._gate_worker_lock:
+            if self._gate_worker is not None:
+                return
+            cmd = self._gate_worker_cmd()
+            if cmd is None:
+                return
+            try:
+                proc = subprocess.Popen(
+                    cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.debug("wake word: gate worker prewarm failed: %s", e)
+                return
+            if proc.stdin is None or proc.stdout is None:
+                proc.kill()
+                return
+            self._gate_worker = proc
+            logger.info("wake word: speaker gate worker prewarmed (pid %s)", proc.pid)
+
+    def _gate_verdict_worker(self, wav_bytes: bytes) -> Optional[Dict[str, Any]]:
+        """Ask the persistent worker for a verdict. None if the worker is down."""
+        import base64
+        import json
+        import subprocess
+
+        with self._gate_worker_lock:
+            proc = self._gate_worker
+            if proc is None or proc.poll() is not None:
+                cmd = self._gate_worker_cmd()
+                if cmd is None:
+                    return None
+                try:
+                    proc = subprocess.Popen(
+                        cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("wake word: gate worker spawn failed: %s", e)
+                    return None
+                if proc.stdin is None or proc.stdout is None:
+                    self._kill_gate_worker_locked()
+                    logger.warning("wake word: gate worker pipes unavailable")
+                    return None
+                self._gate_worker = proc
+            try:
+                req = json.dumps({
+                    "audio_b64": base64.b64encode(wav_bytes).decode("ascii"),
+                    "threshold": float(self._gate.get("threshold", 0.50)),
+                }) + "\n"
+                proc.stdin.write(req.encode("ascii"))
+                proc.stdin.flush()
+                line = proc.stdout.readline()
+            except Exception as e:  # noqa: BLE001
+                self._kill_gate_worker_locked()
+                logger.warning("wake word: gate worker I/O failed: %s", e)
+                return None
+            if not line:
+                self._kill_gate_worker_locked()
+                return None
+            try:
+                return json.loads(line.decode("ascii", "replace"))
+            except Exception:  # noqa: BLE001
+                self._kill_gate_worker_locked()
+                return None
+
+    def _kill_gate_worker_locked(self) -> None:
+        """Terminate the worker. Caller must hold _gate_worker_lock."""
+        proc = self._gate_worker
+        self._gate_worker = None
+        if proc is not None:
+            try:
+                proc.kill()
+                proc.wait(timeout=2)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _gate_verdict_oneshot(self, wav_bytes: bytes) -> Dict[str, Any]:
+        """One-shot gate subprocess (cold start, ~1.75 s). Fail-closed."""
+        import json
+        import subprocess
+
+        refs = [str(r) for r in (self._gate.get("refs") or [])]
+        cmd = [
+            str(self._gate.get("python")),
+            str(self._gate.get("gate_script")),
+            "--refs", *refs,
+            "--threshold", str(self._gate.get("threshold", 0.50)),
+        ]
+        proc = subprocess.run(cmd, input=wav_bytes, capture_output=True, timeout=10)
+        lines = proc.stdout.decode().strip().splitlines()
+        if not lines:
+            return {"pass": False, "error": "no gate output"}
+        try:
+            return json.loads(lines[-1])
+        except Exception:  # noqa: BLE001
+            return {"pass": False, "error": "bad gate output"}
+
     def process(self, frame) -> bool:
+        # Keep a rolling buffer of recent audio for the speaker gate.
+        if self._gate_enabled:
+            self._gate_buf.append(frame)
         scores = self._model.predict(frame)
         over = any(score >= self._threshold for score in scores.values())
         # Require N consecutive over-threshold frames: a real phrase holds the
@@ -497,6 +771,12 @@ class _OpenWakeWordEngine(_Engine):
             self._confirm_streak += 1
             if self._confirm_streak >= self._confirm_needed:
                 self._confirm_streak = 0
+                # Voice-keyed: confirm the speaker before firing. Fail-closed.
+                if self._gate_enabled and not self._speaker_gate_pass():
+                    logger.info(
+                        "wake word: phrase detected but speaker gate rejected — not firing"
+                    )
+                    return False
                 return True
             return False
         self._confirm_streak = 0
@@ -513,6 +793,8 @@ class _OpenWakeWordEngine(_Engine):
 
     def close(self) -> None:
         self.reset()
+        with self._gate_worker_lock:
+            self._kill_gate_worker_locked()
 
 
 # sherpa-onnx open-vocabulary KWS model: a small streaming zipformer

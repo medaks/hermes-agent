@@ -3053,10 +3053,14 @@ def text_to_speech_tool(
                 logger.info("Generating speech with Edge TTS...")
                 try:
                     import concurrent.futures
+                    # Timeout enlarged and made configurable: on-device users
+                    # prefer completeness over speed. Override via
+                    # HERMES_TTS_TIMEOUT (seconds); default 600s (was 60s).
+                    _tts_timeout = int(os.environ.get("HERMES_TTS_TIMEOUT", "600"))
                     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                         pool.submit(
                             lambda: asyncio.run(_generate_edge_tts(text, file_str, tts_config))
-                        ).result(timeout=60)
+                        ).result(timeout=_tts_timeout)
                 except RuntimeError:
                     asyncio.run(_generate_edge_tts(text, file_str, tts_config))
             elif _check_neutts_available():
@@ -3404,7 +3408,13 @@ class _SyncSentencePipeline:
             return None
         tmp_path = None
         try:
-            fd, tmp_path = tempfile.mkstemp(suffix=".mp3")
+            # VM audio stack: WAV (not mp3) so play_audio_file uses the
+            # sounddevice path, plug-resampled to the loopback's 16 kHz.
+            # mp3 forces the system-player fallback, which opens the loopback
+            # at the file's native rate and breaks the 16 kHz wake word
+            # re-arm (paInvalidSampleRate). Mistral returns 24 kHz WAV, which
+            # the plug resamples cleanly.
+            fd, tmp_path = tempfile.mkstemp(suffix=".wav")
             os.close(fd)
             text_to_speech_tool(text=cleaned, output_path=tmp_path)
             return tmp_path

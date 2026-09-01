@@ -211,7 +211,32 @@ def _supports_vision_override(
     model_cfg: Dict[str, Any] = model_cfg_raw if isinstance(model_cfg_raw, dict) else {}
     top = _coerce_capability_bool(model_cfg.get("supports_vision"))
     if top is not None:
-        return top
+        # Scope the top-level shortcut to the model it was declared for. The
+        # `model:` block describes ONE model (default + provider); its
+        # supports_vision flag must not leak to a session whose active model
+        # was switched away (e.g. `model.supports_vision: true` for a local
+        # vLLM vision model must not make a text-only DeepSeek session try
+        # native image routing and 400 with "This model does not support
+        # image"). Match when the queried model equals the declared default,
+        # or when the queried provider matches the declared provider and the
+        # model name is unknown/empty (provider-level declaration).
+        declared_default = str(model_cfg.get("default") or "").strip()
+        declared_provider = str(model_cfg.get("provider") or "").strip()
+        queried_model = str(model or "").strip()
+        queried_provider = str(provider or "").strip().lower()
+        declared_provider_l = declared_provider.strip().lower()
+        model_matches = declared_default and queried_model and queried_model == declared_default
+        provider_matches = declared_provider_l and queried_provider and (
+            queried_provider == declared_provider_l
+            or queried_provider == declared_provider_l.removeprefix("custom:")
+            or queried_provider == "custom"
+        )
+        if not model_matches and not provider_matches:
+            # The active model isn't the declared vision-capable one — do not
+            # apply the top-level flag; fall through to per-model lookups.
+            top = None
+        else:
+            return top
 
     # 2. Per-provider, per-model. Named custom providers (e.g. "my-vllm")
     # get rewritten to provider="custom" at runtime

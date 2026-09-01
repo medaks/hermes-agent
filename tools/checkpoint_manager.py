@@ -101,6 +101,9 @@ DEFAULT_EXCLUDES = [
     ".venv/",
     "venv/",
     "env/",
+    # Hermes internal directories (projects, checkpoints, etc.)
+    ".hermes/projects/",
+    ".hermes/checkpoints/",
     # VCS
     ".git/",
     ".hg/",

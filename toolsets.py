@@ -56,7 +56,9 @@ _HERMES_CORE_TOOLS = [
     # Text-to-speech
     "text_to_speech",
     # Planning & memory
-    "todo", "memory",
+    # NOTE: "memory" tool disabled — agent uses read_file + memory_index.md
+    # pointer instead. compress_context remains for context management.
+    "todo",
     # NOTE: the desktop Project tools (project_list/create/switch) are
     # deliberately NOT here. They only make sense where a GUI can follow the
     # move, so they live in the `project` toolset and are enabled solely by the
@@ -83,6 +85,8 @@ _HERMES_CORE_TOOLS = [
     "kanban_attach", "kanban_attach_url", "kanban_attachments",
     # Computer use (macOS, gated on cua-driver being installed via check_fn)
     "computer_use",
+    # Conversation context management (allows agent to compact its own context)
+    "compress_context",
 ]
 
 # Webhook events may originate from untrusted third-party content (for example,
@@ -102,7 +106,7 @@ TOOLSETS = {
     # Basic toolsets - individual tool categories
     "web": {
         "description": "Web research and content extraction tools",
-        "tools": ["web_search", "web_extract"],
+        "tools": ["web_search", "web_extract", "compress_context"],
         "includes": []  # No other toolsets included
     },
     
@@ -127,7 +131,7 @@ TOOLSETS = {
     
     "vision": {
         "description": "Image analysis and vision tools",
-        "tools": ["vision_analyze"],
+        "tools": ["vision_analyze", "compress_context"],
         "includes": []
     },
 
@@ -139,7 +143,7 @@ TOOLSETS = {
     
     "image_gen": {
         "description": "Creative generation tools (images)",
-        "tools": ["image_generate"],
+        "tools": ["image_generate", "compress_context"],
         "includes": []
     },
 
@@ -186,13 +190,13 @@ TOOLSETS = {
 
     "terminal": {
         "description": "Terminal/command execution and process management tools",
-        "tools": ["terminal", "process"],
+        "tools": ["terminal", "process", "compress_context"],
         "includes": []
     },
     
     "skills": {
         "description": "Access, create, edit, and manage skill documents with specialized instructions and knowledge",
-        "tools": ["skills_list", "skill_view", "skill_manage"],
+        "tools": ["skills_list", "skill_view", "skill_manage", "compress_context"],
         "includes": []
     },
     
@@ -203,39 +207,39 @@ TOOLSETS = {
             "browser_type", "browser_scroll", "browser_back",
             "browser_press", "browser_get_images",
             "browser_vision", "browser_console", "browser_cdp",
-            "browser_dialog", "web_search"
+            "browser_dialog", "web_search", "compress_context"
         ],
         "includes": []
     },
     
     "cronjob": {
         "description": "Cronjob management tool - create, list, update, pause, resume, remove, and trigger scheduled tasks",
-        "tools": ["cronjob"],
+        "tools": ["cronjob", "compress_context"],
         "includes": []
     },
     
 
     "file": {
         "description": "File manipulation tools: read, write, patch (with fuzzy matching), and search (content + files)",
-        "tools": ["read_file", "write_file", "patch", "search_files"],
+        "tools": ["read_file", "write_file", "patch", "search_files", "compress_context"],
         "includes": []
     },
     
     "tts": {
         "description": "Text-to-speech: convert text to audio with Edge TTS (free), ElevenLabs, OpenAI, or xAI",
-        "tools": ["text_to_speech"],
+        "tools": ["text_to_speech", "compress_context"],
         "includes": []
     },
     
     "todo": {
         "description": "Task planning and tracking for multi-step work",
-        "tools": ["todo"],
+        "tools": ["todo", "compress_context"],
         "includes": []
     },
     
     "memory": {
-        "description": "Persistent memory across sessions (personal notes + user profile)",
-        "tools": ["memory"],
+        "description": "Persistent memory across sessions (personal notes + user profile) — tool disabled, agent uses read_file + memory_index.md",
+        "tools": ["compress_context"],
         "includes": []
     },
 
@@ -247,7 +251,7 @@ TOOLSETS = {
     
     "session_search": {
         "description": "Search and recall past conversations with summarization",
-        "tools": ["session_search"],
+        "tools": ["session_search", "compress_context"],
         "includes": []
     },
 
@@ -259,19 +263,19 @@ TOOLSETS = {
     
     "clarify": {
         "description": "Ask the user clarifying questions (multiple-choice or open-ended)",
-        "tools": ["clarify"],
+        "tools": ["clarify", "compress_context"],
         "includes": []
     },
     
     "code_execution": {
         "description": "Run Python scripts that call tools programmatically (reduces LLM round trips)",
-        "tools": ["execute_code"],
+        "tools": ["execute_code", "compress_context"],
         "includes": []
     },
     
     "delegation": {
         "description": "Spawn subagents with isolated context for complex subtasks",
-        "tools": ["delegate_task"],
+        "tools": ["delegate_task", "compress_context"],
         "includes": []
     },
 
@@ -280,7 +284,7 @@ TOOLSETS = {
 
     "homeassistant": {
         "description": "Home Assistant smart home control and monitoring",
-        "tools": ["ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service"],
+        "tools": ["ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service", "compress_context"],
         "includes": []
     },
 
@@ -300,6 +304,7 @@ TOOLSETS = {
             "kanban_create", "kanban_link",
             "kanban_unblock",
             "kanban_attach", "kanban_attach_url", "kanban_attachments",
+            "compress_context",
         ],
         "includes": [],
     },
@@ -383,9 +388,10 @@ TOOLSETS = {
             "browser_type", "browser_scroll", "browser_back",
             "browser_press", "browser_get_images",
             "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
-            "todo", "memory",
+            "todo",
             "session_search", "clarify",
             "execute_code", "delegate_task",
+            "compress_context",
         ],
         "includes": [],
         # Posture toolset: selected per-session by agent/coding_context.py,
@@ -415,9 +421,10 @@ TOOLSETS = {
             "browser_type", "browser_scroll", "browser_back",
             "browser_press", "browser_get_images",
             "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
-            "todo", "memory",
+            "todo",
             "session_search",
             "execute_code", "delegate_task",
+            "compress_context",
         ],
         "includes": []
     },
@@ -445,7 +452,7 @@ TOOLSETS = {
             "browser_press", "browser_get_images",
             "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
             # Planning & memory
-            "todo", "memory",
+            "todo",
             # Session history search
             "session_search",
             # Code execution + delegation
@@ -454,7 +461,8 @@ TOOLSETS = {
             "cronjob",
             # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
             "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
-
+            # Conversation context management
+            "compress_context",
         ],
         "includes": []
     },

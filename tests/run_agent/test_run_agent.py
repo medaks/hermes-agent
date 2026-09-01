@@ -2001,7 +2001,43 @@ class TestConcurrentToolExecution:
             mock_todo.assert_called_once()
         assert "ok" in result
 
+    def test_sequential_compress_context_routes_via_invoke_tool(self, agent):
+        """Sequential path must execute compress_context via _invoke_tool."""
+        tool_call = _mock_tool_call(
+            name="compress_context",
+            arguments='{"focus_topic":"schema","force":true}',
+            call_id="c1",
+        )
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tool_call])
+        messages = []
 
+        with (
+            patch.object(agent, "_invoke_tool", return_value='{"success": true}') as mock_invoke,
+            patch("run_agent.handle_function_call", side_effect=AssertionError("should not run")),
+        ):
+            agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
+
+        mock_invoke.assert_called_once_with(
+            "compress_context",
+            {"focus_topic": "schema", "force": True},
+            "task-1",
+            "c1",
+            messages=messages,
+            pre_tool_block_checked=True,
+        )
+
+    def test_invoke_tool_agent_level_tool_emits_terminal_post_tool_hook(self, agent, monkeypatch):
+        """Agent-owned tool paths should close observer tool spans."""
+        hook_calls = []
+        monkeypatch.setattr(
+            "hermes_cli.plugins.resolve_pre_tool_block",
+            lambda *args, **kwargs: None,
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: hook_calls.append((hook_name, kwargs)) or [],
+        )
+        monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda name: True)
 
 
     def test_sequential_blocked_tool_skips_checkpoints_and_callbacks(self, agent, monkeypatch):
@@ -6046,4 +6082,3 @@ class TestMemoryContextSanitization:
         assert "memory-context" not in result.lower()
         assert "stale observation" not in result
         assert "how is the honcho working" in result
-

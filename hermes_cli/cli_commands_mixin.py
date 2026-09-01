@@ -3269,28 +3269,36 @@ class CLICommandsMixin:
     def _handle_wake_command(self, command: str):
         """Handle /wake [on|off|status] — the 'Hey Hermes' hotword listener.
 
-        The toggle IS the config: an explicit on/off (or bare toggle) also
-        writes ``wake_word.enabled`` to config.yaml so the choice persists
-        across sessions. Startup auto-arm (_maybe_start_wake_word) only reads.
+        /wake on arms the listener in THIS session only. It deliberately
+        does NOT write ``wake_word.enabled`` to config, so new sessions
+        never auto-arm and the wake word cannot be stolen by a later
+        session. The choice to run the wake word is a per-session act —
+        re-run /wake on after each restart of the keeper session.
+
+        /wake off still persists ``enabled: false`` (harmless — that IS the
+        default), which lets a session that had it on via config turn it
+        off globally. Startup auto-arm (_maybe_start_wake_word) only reads
+        config: leave ``wake_word.enabled`` false for text-only sessions,
+        or set it true deliberately for an always-on setup.
         """
         from cli import _cprint
         parts = command.strip().split(maxsplit=1)
         subcommand = parts[1].lower().strip() if len(parts) > 1 else ""
 
         if subcommand == "on":
-            if self._start_wake_word_listener(announce=True):
-                self._persist_wake_word_enabled(True)
+            # Session-local arm: never persist, so future sessions stay text-only.
+            self._start_wake_word_listener(announce=True)
         elif subcommand == "off":
             self._stop_wake_word_listener(announce=True)
             self._persist_wake_word_enabled(False)
         elif subcommand in ("", "status"):
             if subcommand == "":
-                # Bare /wake toggles.
+                # Bare /wake toggles (also session-local for the on side).
                 if getattr(self, "_wake_word_active", False):
                     self._stop_wake_word_listener(announce=True)
                     self._persist_wake_word_enabled(False)
-                elif self._start_wake_word_listener(announce=True):
-                    self._persist_wake_word_enabled(True)
+                else:
+                    self._start_wake_word_listener(announce=True)
             else:
                 self._show_wake_word_status()
         else:

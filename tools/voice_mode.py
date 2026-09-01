@@ -291,12 +291,35 @@ def detect_audio_environment() -> dict:
         or _pulse_socket_reachable()
     )
 
+    # VM audio stack: the snd-aloop virtual card IS our audio hardware.
+    # The mic and speakers live on the laptop; a UDP relay feeds/reads the
+    # loopback. There is deliberately NO PulseAudio/PipeWire server here,
+    # so the SSH/container checks below must not hard-block when the
+    # loopback card is present. Probe it early so those blocks can defer.
+    _loopback_devices = []
+    try:
+        _sd, _ = _import_audio()
+        for _d in _sd.query_devices():
+            _n = str(_d.get('name') or '')
+            if 'hw:1' in _n or 'Loopback' in _n:
+                _loopback_devices.append(_n)
+    except Exception:
+        pass
+    has_loopback = bool(_loopback_devices)
+
     # SSH detection -- normally no audio devices, but honor a reachable
     # sound server (PulseAudio/PipeWire socket or forwarding env vars), which
-    # works fine over SSH (issue #35622).
+    # works fine over SSH (issue #35622).  The VM audio stack is the
+    # exception: the snd-aloop virtual card is a real PortAudio device, so
+    # SSH without a sound server is fine here.
     if any(os.environ.get(v) for v in ('SSH_CLIENT', 'SSH_TTY', 'SSH_CONNECTION')):
         if has_forwarded_audio:
             notices.append("Running over SSH with a reachable PulseAudio/PipeWire sound server")
+        elif has_loopback:
+            notices.append(
+                "Running over SSH with the snd-aloop virtual audio card "
+                "(VM audio stack: laptop mic/speakers via UDP relay)"
+            )
         else:
             warnings.append(
                 "Running over SSH -- no audio devices available.\n"
@@ -310,10 +333,16 @@ def detect_audio_environment() -> dict:
     # When the user mounts a PulseAudio/PipeWire socket into the container
     # and points PULSE_SERVER / PIPEWIRE_REMOTE at it, audio works fine
     # (issue #21203).  Only block when no forwarding is configured.
+    # The snd-aloop virtual card (VM audio stack) also satisfies this.
     from hermes_constants import is_container
     if is_container():
         if has_forwarded_audio:
             notices.append("Running inside container (Docker/Podman/LXC) with host audio forwarding")
+        elif has_loopback:
+            notices.append(
+                "Running inside container with the snd-aloop virtual audio card "
+                "(VM audio stack: laptop mic/speakers via UDP relay)"
+            )
         else:
             warnings.append(
                 "Running inside container (Docker/Podman/LXC) -- no audio devices.\n"
@@ -1078,7 +1107,13 @@ class AudioRecorder:
             self._current_rms = 0
             self._on_silence_stop = on_silence_stop
         # Ensure the persistent stream is alive (no-op after first call).
-        self._sample_rate = _default_input_samplerate(sd)
+        # VM audio stack: always record at the wake word's 16 kHz rate so the
+        # persistent recorder stream and the wake-word listener can share the
+        # snd-aloop virtual mic (two streams at DIFFERENT rates on the same
+        # loopback substream conflict: the 44.1k recorder blocks the 16k wake
+        # word's re-arm after the first turn). The default device (plug ->
+        # hw:1,1) advertises 44100, which is why we pin 16 kHz here.
+        self._sample_rate = SAMPLE_RATE  # 16000, not _default_input_samplerate(sd)
         self._ensure_stream()
 
         with self._lock:
@@ -1113,7 +1148,12 @@ class AudioRecorder:
         """Stop recording and write captured audio to a WAV file.
 
         The underlying stream is kept alive for reuse — only frame
-        collection is stopped.
+        collection is stopped.  EXCEPT on Linux/ALSA (the VM audio stack):
+        keeping a persistent capture on the snd-aloop card holds substream
+        sub0 forever, so the wake-word listener's re-arm lands on sub1 and
+        never hears the mic again ("works once, then silence").  Release
+        the stream when idle on non-macOS so the wake word can reclaim
+        sub0; the next recording re-creates it via _ensure_stream.
 
         Returns:
             Path to the WAV file, or ``None`` if no audio was captured.
@@ -1124,7 +1164,11 @@ class AudioRecorder:
 
             self._recording = False
             self._current_rms = 0
-            # Stream stays alive — no close needed.
+            # Stream stays alive — no close needed.  (macOS CoreAudio:
+            # closing/re-opening hangs; Linux/ALSA: must release so the
+            # wake-word listener can re-arm on substream 0.)
+            if os.name != "nt" and sys.platform != "darwin":
+                self._close_stream_with_timeout()
 
             if not self._frames:
                 return None
@@ -1155,13 +1199,17 @@ class AudioRecorder:
     def cancel(self) -> None:
         """Stop recording and discard all captured audio.
 
-        The underlying stream is kept alive for reuse.
+        The underlying stream is kept alive for reuse.  EXCEPT on
+        Linux/ALSA (see stop()): release the stream so the wake-word
+        listener can re-arm on substream 0.
         """
         with self._lock:
             self._recording = False
             self._frames = []
             self._on_silence_stop = None
             self._current_rms = 0
+            if os.name != "nt" and sys.platform != "darwin":
+                self._close_stream_with_timeout()
         logger.info("Voice recording cancelled")
 
     def shutdown(self) -> None:
@@ -1589,6 +1637,24 @@ def _play_audio_file_impl(file_path: str) -> bool:
                 frames = wf.readframes(wf.getnframes())
                 audio_data = np.frombuffer(frames, dtype=np.int16)
                 sample_rate = wf.getframerate()
+
+            # VM audio stack: resample to 16 kHz before playing. TTS files
+            # arrive at the provider's native rate (Mistral: 24 kHz); if
+            # played at that rate, the ALSA plug opens the snd-aloop pair at
+            # 24 kHz while the relay holds the paired capture at 16 kHz —
+            # snd-aloop then delivers a clipped half-rate stream (~5 pkts/s
+            # of 624-sample chunks) and the wake word's 16 kHz re-arm fails
+            # with paInvalidSampleRate. Linear resample to SAMPLE_RATE (16k)
+            # keeps every path on one rate. (Only done when needed; 16 kHz
+            # audio passes through unchanged.)
+            if sample_rate != SAMPLE_RATE and len(audio_data) > 0:
+                n_out = int(len(audio_data) * SAMPLE_RATE / sample_rate)
+                x_old = np.linspace(0.0, 1.0, len(audio_data), endpoint=False)
+                x_new = np.linspace(0.0, 1.0, n_out, endpoint=False)
+                audio_data = np.interp(
+                    x_new, x_old, audio_data.astype(np.float64)
+                ).astype(np.int16)
+                sample_rate = SAMPLE_RATE
 
             # WSLg RDP audio needs a warmup to avoid crackling at the start.
             # The RDP virtual-channel connection takes ~100 ms to stabilise,

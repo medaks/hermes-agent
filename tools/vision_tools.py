@@ -863,15 +863,27 @@ def _should_use_native_vision_fast_path() -> bool:
     The override is the escape hatch for custom/local providers that aren't in
     the static allowlist. Best-effort: any resolution failure returns False so
     the caller falls back to the legacy aux-LLM path.
+
+    An explicitly configured ``auxiliary.vision`` backend always wins over the
+    native fast path: if the user pointed vision at a dedicated backend (e.g.
+    a local vLLM o2), that backend is authoritative regardless of the active
+    main model — otherwise switching the main model (e.g. to a text-only
+    DeepSeek) would silently route images to a model that 400s.
     """
     try:
         from agent.auxiliary_client import _read_main_provider, _read_main_model
-        from agent.image_routing import decide_image_input_mode, _lookup_supports_vision
+        from agent.image_routing import (
+            _explicit_aux_vision_override,
+            decide_image_input_mode,
+            _lookup_supports_vision,
+        )
         from hermes_cli.config import load_config
 
+        cfg = load_config()
+        if _explicit_aux_vision_override(cfg):
+            return False
         provider = _read_main_provider()
         model = _read_main_model()
-        cfg = load_config()
         if decide_image_input_mode(provider, model, cfg) != "native":
             return False
         return (

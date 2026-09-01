@@ -27,5 +27,7 @@ def test_memory_tool_imports_without_fcntl(monkeypatch, tmp_path):
     result = store.add("memory", "fact learned during import fallback test")
 
     assert memory_tool.fcntl is None
-    assert registry.get_entry("memory") is not None
+    # Memory tool registration is intentionally disabled — the agent now
+    # consults on-disk memory files via read_file + memory_index.md pointer.
+    assert registry.get_entry("memory") is None
     assert result["success"] is True

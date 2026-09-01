@@ -2975,6 +2975,15 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     elif function_name == "delegate_task":
         def _execute(next_args: dict) -> Any:
             return _finish_agent_tool(agent._dispatch_delegate_task(next_args), next_args)
+    elif function_name == "compress_context":
+        from tools.compress_context_tool import compress_context_tool as _compress_context_tool
+        return _compress_context_tool(
+            agent=agent,
+            messages=messages,
+            task_id=effective_task_id,
+            focus_topic=function_args.get("focus_topic"),
+            force=bool(function_args.get("force", False)),
+        )
     else:
         def _execute(next_args: dict) -> Any:
             dispatch_kwargs = dict(

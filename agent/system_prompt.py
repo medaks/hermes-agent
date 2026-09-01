@@ -229,7 +229,13 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         tool_guidance.append(MEMORY_GUIDANCE)
     if "session_search" in agent.valid_tool_names:
         tool_guidance.append(SESSION_SEARCH_GUIDANCE)
-    if "skill_manage" in agent.valid_tool_names:
+    # SKILLS_GUIDANCE is injected whenever the agent has ANY tools loaded,
+    # not only when skill_manage is present. The Qwen3.6 / GLM model families
+    # produce structured tool calls reliably only when this guidance text is
+    # in the system prompt; omitting it (e.g. on the api_server platform which
+    # loads a minimal toolset without skills tools) causes the model to emit
+    # tool-call syntax as plain text instead of structured function calls.
+    if agent.valid_tool_names:
         tool_guidance.append(SKILLS_GUIDANCE)
     # Kanban worker/orchestrator lifecycle — only present when the
     # dispatcher spawned this process (kanban_show check_fn gates on
@@ -429,6 +435,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         )
 
     platform_key = (agent.platform or "").lower().strip()
+    # Treat api_server as cli for system prompt assembly — the api_server
+    # platform hint breaks tool-calling on Qwen3.6/o2.
+    if platform_key == "api_server":
+        platform_key = "cli"
     # Resolve the built-in/plugin default hint for this platform, then apply
     # any per-platform override from config (platform_hints.<platform>).
     _default_hint = ""
@@ -512,16 +522,36 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if skills_prompt:
         volatile_parts.append(skills_prompt)
 
-    if agent._memory_store:
-        if agent._memory_enabled:
-            mem_block = agent._memory_store.format_for_system_prompt("memory")
-            if mem_block:
-                volatile_parts.append(mem_block)
-        # USER.md is always included when enabled.
-        if agent._user_profile_enabled:
-            user_block = agent._memory_store.format_for_system_prompt("user")
-            if user_block:
-                volatile_parts.append(user_block)
+    # MEMORY.md and USER.md are NOT injected into the system prompt — the
+    # memory index reference below points the agent at the richer per-domain
+    # memory files on disk, which the agent reads on demand via the memory
+    # tool / read_file. Inlining the raw entries here bloats the prompt and
+    # invalidates the prefix cache whenever any entry changes.
+
+    # ── Memory index reference ──
+    # Dynamically inject the contents of memory_index.md into the system
+    # prompt. The file path is stable across sessions (cache-friendly); the
+    # file contents are read at session start so editing the .md instantly
+    # updates the system prompt without code changes.
+    import os as _os
+    _mem_index_path = _os.path.expanduser(
+        "~/.hermes/projects/2026-05-21-memory-update/memory_index.md"
+    )
+    if _os.path.isfile(_mem_index_path):
+        try:
+            with open(_mem_index_path, "r", encoding="utf-8") as _f:
+                _mem_index_content = _f.read().strip()
+            volatile_parts.append(
+                "Memory index, found on "
+                "/home/o/.hermes/projects/2026-05-21-memory-update/memory_index.md\n\n"
+                + _mem_index_content
+            )
+        except Exception:
+            volatile_parts.append(
+                "Memory index, found on "
+                "/home/o/.hermes/projects/2026-05-21-memory-update/memory_index.md\n\n"
+                "Consult appropriate memories before engaging in that domain."
+            )
 
     # External memory provider system prompt block (additive to built-in)
     if agent._memory_manager:

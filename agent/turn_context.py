@@ -545,6 +545,14 @@ def build_turn_context(
     # Add the current user message after the prompt/session setup has made
     # close persistence safe. The handoff above preserves any marker already
     # stamped by an earlier close flush.
+    # If this is a new session, remind the agent about the memory index.
+    if not conversation_history:
+        user_msg["content"] = (
+            str(user_msg.get("content", ""))
+            + "\n\nAre any of the memories relevant to what the user asks of you? Consult them!\n\n"
+            "Memory index, found on /home/o/.hermes/projects/2026-05-21-memory-update/memory_index.md"
+        )
+
     #
     # A synthesized turn (auto-continue recovery note, delegation completion)
     # declares how it should READ in a transcript. Stamp that on the live
@@ -564,6 +572,8 @@ def build_turn_context(
 
     # Track user turns for memory flush and periodic nudge logic.
     agent._user_turn_count += 1
+    # Reset tool call counter — a new user message starts a fresh count.
+    agent._tool_calls_since_user = 0
     # Copilot x-initiator: the first API call of this user turn is
     # user-initiated; tool-loop follow-ups revert to "agent" (#3040).
     agent._is_user_initiated_turn = True

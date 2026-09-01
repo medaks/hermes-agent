@@ -1218,22 +1218,25 @@ MEMORY_SCHEMA = {
 
 
 # --- Registry ---
-from tools.registry import registry, tool_error
+# Disabled — memory tool registration commented out. The agent now consults
+# on-disk memory files via read_file using the memory_index.md pointer in the
+# system prompt, rather than through the built-in memory tool.
+from tools.registry import registry, tool_error  # noqa: F401 — tool_error still used below
 
-registry.register(
-    name="memory",
-    toolset="memory",
-    schema=MEMORY_SCHEMA,
-    handler=lambda args, **kw: memory_tool(
-        action=args.get("action", ""),
-        target=args.get("target", "memory"),
-        content=args.get("content"),
-        old_text=args.get("old_text"),
-        operations=args.get("operations"),
-        store=kw.get("store")),
-    check_fn=check_memory_requirements,
-    emoji="🧠",
-)
+# registry.register(
+#     name="memory",
+#     toolset="memory",
+#     schema=MEMORY_SCHEMA,
+#     handler=lambda args, **kw: memory_tool(
+#         action=args.get("action", ""),
+#         target=args.get("target", "memory"),
+#         content=args.get("content"),
+#         old_text=args.get("old_text"),
+#         operations=args.get("operations"),
+#         store=kw.get("store")),
+#     check_fn=check_memory_requirements,
+#     emoji="🧠",
+# )
 
 
 
