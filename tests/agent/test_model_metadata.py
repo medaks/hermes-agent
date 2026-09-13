@@ -358,6 +358,8 @@ class TestDefaultContextLengths:
             "deepseek-v4-flash": 1_000_000,
             "deepseek-chat": 1_000_000,
             "deepseek-reasoner": 1_000_000,
+            # Version-less canonical Flash id (2026-09 Flash refresh).
+            "deepseek-flash": 1_000_000,
         }
         for key, value in expected_keys.items():
             assert key in DEFAULT_CONTEXT_LENGTHS, f"{key} missing"
@@ -379,6 +381,8 @@ class TestDefaultContextLengths:
                 ("deepseek/deepseek-v4-flash", 1_000_000),
                 ("deepseek-chat", 1_000_000),
                 ("deepseek-reasoner", 1_000_000),
+                ("deepseek-flash", 1_000_000),
+                ("deepseek/deepseek-flash", 1_000_000),
             ]
             for model_id, expected_ctx in cases:
                 actual = get_model_context_length(model_id)
@@ -1088,13 +1092,14 @@ class TestGetModelContextLength:
         mock_fetch.return_value = {}
         mock_endpoint_fetch.return_value = {}
 
-        # GLM-5-TEE matches the "glm" entry in DEFAULT_CONTEXT_LENGTHS
+        # GLM-5-TEE resolves through DEFAULT_CONTEXT_LENGTHS (longest matching GLM key), not the generic default.
         result = get_model_context_length(
             "zai-org/GLM-5-TEE",
             base_url="https://llm.chutes.ai/v1",
             api_key="test-key",
         )
-        assert result == 202752  # "glm" entry in DEFAULT_CONTEXT_LENGTHS
+        from agent.model_metadata import DEFAULT_CONTEXT_LENGTHS, _longest_key_match
+        assert result == _longest_key_match(DEFAULT_CONTEXT_LENGTHS, "zai-org/glm-5-tee")[1]
 
 
 
@@ -1715,6 +1720,13 @@ class TestGenericPreCatalogStaleGuard:
         assert not _stale_pre_catalog_cache_entry("grok-4.20", 2_000_000)
         # Sibling qwen slugs with legitimately small windows are untouched.
         assert not _stale_pre_catalog_cache_entry("qwen3-coder", 131_072)
+        # DeepSeek V4 / V4.1 Flash: 1M. Pre-entry builds persisted the 128K
+        # ``deepseek`` catch-all; a leftover must drop, a 1M value must not.
+        assert _stale_pre_catalog_cache_entry("deepseek-flash", 128_000)
+        assert _stale_pre_catalog_cache_entry("deepseek/deepseek-flash", 128_000)
+        assert _stale_pre_catalog_cache_entry("deepseek-v4-pro", 128_000)
+        assert not _stale_pre_catalog_cache_entry("deepseek-flash", 1_000_000)
+        assert not _stale_pre_catalog_cache_entry("deepseek", 128_000)
 
     def test_unknown_models_never_dropped(self):
         from agent.model_metadata import _stale_pre_catalog_cache_entry
