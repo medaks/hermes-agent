@@ -1127,6 +1127,12 @@ DEFAULT_CONFIG = {
         "thinking_sound": True,  # ambient bubble sound while the agent works (volume = beep_volume)
         "silence_threshold": 200,  # RMS below this = silence (0-32767)
         "silence_duration": 3.0,  # seconds of silence before auto-stop
+        "no_speech_timeout": 15.0,  # seconds to wait for the FIRST speech before
+                                    # auto-stopping; once speech is heard the stop is
+                                    # silence_duration of trailing silence. Raise to
+                                    # keep the mic open while you think/read.
+        "no_speech_cycles": 3,  # consecutive no-speech captures that end continuous
+                                # voice mode (1 = a single silent wait ends it)
         "speak_final_only": False,  # voice mode: speak ONLY the final response,
                                     # not intermediate assistant messages
                                     # (e.g. a preliminary answer before tool
@@ -1140,6 +1146,11 @@ DEFAULT_CONFIG = {
         # Saying EXACTLY one of these (case-insensitive, punctuation ignored) ends the voice chat
         # instead of going to the agent. [] disables.
         "stop_phrases": ["stop"],
+        # Continuous voice: settle grace (seconds) AFTER the answer's audio output has
+        # gone quiet before the mic re-arms. The loopback recorder hears the speakers
+        # through the relay, so re-arming into the answer's tail captures the assistant's
+        # own last words as a user turn. Custom key.
+        "continuous_mic_grace": 1.5,
     },
     # "Hey Hermes" hands-free wake word: always-on, on-device hotword detection that starts a fresh
     # voice session. Off by default; toggle with /wake.
@@ -1159,6 +1170,10 @@ DEFAULT_CONFIG = {
         # triggers, more latency; 1 = single-frame)
         "confirmation_frames": 3,
         "start_new_session": True,  # fresh session on wake vs. continue the current one
+        # Wake fires arm CONTINUOUS voice (mic re-arms after each answer so follow-up
+        # questions need no repeated wake; the spoken voice.stop_phrases word or three
+        # silent cycles end it) instead of a single utterance per wake. Custom key.
+        "continuous": False,
         # sherpa only: listen for every wake-enabled profile's phrase and route to it
         "profile_routing": True,
         "openwakeword": {

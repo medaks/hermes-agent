@@ -230,7 +230,22 @@ class CLIChatTurnMixin:
                 from tools.tts_tool import _import_sounddevice, check_tts_requirements
                 from tools.tts_tool_speaker import stream_tts_to_speaker
                 _import_sounddevice()
-                turn.use_streaming_tts = check_tts_requirements()
+                # speak_final_only (custom, restored): skip the streaming TTS feed
+                # entirely when set. Streaming speaks EVERY assistant message as it
+                # is generated — including preliminary answers before tool calls.
+                # When only the final answer should be spoken, leave
+                # use_streaming_tts False so the batch path below
+                # (_voice_speak_response_async) speaks the turn's final response
+                # once, in full.
+                _sfo_cfg: dict = {}
+                try:
+                    from hermes_cli.config import load_config
+                    _sfo_raw = load_config().get("voice")
+                    _sfo_cfg = _sfo_raw if isinstance(_sfo_raw, dict) else {}
+                except Exception:
+                    pass
+                if not _sfo_cfg.get("speak_final_only", False):
+                    turn.use_streaming_tts = check_tts_requirements()
             except Exception:
                 pass
 

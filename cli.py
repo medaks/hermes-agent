@@ -3556,11 +3556,60 @@ class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMix
 
         # Continuous voice: restart recording off-thread (beep + recorder start would block process_loop).
         if self._voice_mode and self._voice_continuous and not self._voice_recording:
+            logger.info("continuous voice: re-arming mic after turn (voice_mode=%s continuous=%s)",
+                        self._voice_mode, self._voice_continuous)
             def _restart_recording():
                 try:
-                    if self._voice_tts:
-                        self._voice_tts_done.wait(timeout=60)
-                        time.sleep(0.3)
+                    _fd = getattr(self, "_voice_fd_active", None)
+                    _tts_done = getattr(self, "_voice_tts_done", None)
+                    try:
+                        from tools.voice_mode import is_audio_output_active
+                        _out_active = is_audio_output_active()
+                    except Exception:
+                        _out_active = False
+                    logger.info(
+                        "continuous voice: restart wait start (tts=%s tts_done_set=%s "
+                        "fd_active=%s output_active=%s)",
+                        self._voice_tts,
+                        None if _tts_done is None else _tts_done.is_set(),
+                        None if _fd is None else _fd.is_set(),
+                        _out_active)
+                    _wait_start = time.time()
+                    if self._voice_tts and _tts_done is not None:
+                        _tts_done.wait(timeout=60)
+                        logger.info("continuous voice: tts_done after %.1fs",
+                                    time.time() - _wait_start)
+                    # Wait for the turn's full-duplex barge listener to release the
+                    # mic before re-arming (it holds the fed substream through the
+                    # answer's playback).
+                    if _fd is not None:
+                        _fd_deadline = time.time() + 60.0
+                        while time.time() < _fd_deadline and _fd.is_set():
+                            time.sleep(0.1)
+                        logger.info("continuous voice: fd_active released")
+                    # Custom echo discipline: never re-arm while the answer's
+                    # audio is still in the air or its relay tail has not
+                    # drained — the loopback recorder would capture the
+                    # assistant's own last words as a user turn. Wait for real
+                    # output silence, then a settle grace
+                    # (voice.continuous_mic_grace; default 1.5s).
+                    try:
+                        from tools.voice_mode import is_audio_output_active
+                        _deadline = time.time() + 30.0
+                        while time.time() < _deadline and is_audio_output_active():
+                            time.sleep(0.1)
+                    except Exception:
+                        pass
+                    try:
+                        from hermes_cli.config import load_config
+                        _vc = load_config().get("voice")
+                        _grace = float((_vc if isinstance(_vc, dict) else {}).get(
+                            "continuous_mic_grace", 1.5))
+                    except Exception:
+                        _grace = 1.5
+                    if _grace > 0:
+                        time.sleep(min(_grace, 10.0))
+                    logger.info("continuous voice: re-arming mic now")
                     # A barge-in capture already owns the mic and submits the interruption itself.
                     if self._voice_barge_capture.is_set():
                         return

@@ -5413,11 +5413,13 @@ def _get_cached_client(
             loop_ok = not async_mode or (
                 cached_loop is not None and cached_loop is current_loop and not cached_loop.is_closed()
             )
-            if loop_ok:
+            if loop_ok and not isinstance(cached_client, _AuxProbeClientStub):
                 return cached_client, _compat_model(cached_client, model, cached_default)
-            # Stale async entry — evict. Only a closed owner loop may be awaited here; a live
-            # foreign loop stays force-neutered.
-            _close_cached_client(cached_client, close_async=cached_loop is not None and cached_loop.is_closed())
+            # Stale async entry — or a poisoned probe-stub entry cached before the write guard
+            # existed — evict so a real client is rebuilt instead of serving a dud.
+            # Only a closed owner loop may be awaited here; a live foreign loop stays force-neutered.
+            if not isinstance(cached_client, _AuxProbeClientStub):
+                _close_cached_client(cached_client, close_async=cached_loop is not None and cached_loop.is_closed())
             del _client_cache[cache_key]
     # Build outside the lock. For pool-backed providers derive the key from the pool entry:
     # resolve_api_key_provider_credentials prefers env vars, which would bypass pool rotation
@@ -5433,7 +5435,16 @@ def _get_cached_client(
     )
     if client is not None:
         with _client_cache_lock:
-            if cache_key not in _client_cache:
+            if isinstance(client, _AuxProbeClientStub):
+                # Availability-probe stub (aux_probe_mode): NEVER cache it. A later REAL call
+                # served from this entry would raise "_AuxProbeClientStub used as a real client".
+                # This direct store is a second write path into _client_cache and previously
+                # missed the guard that _store_cached_client() applies.
+                if cache_key in _client_cache:
+                    existing, existing_default, _ = _client_cache[cache_key]
+                    if not isinstance(existing, _AuxProbeClientStub):
+                        return existing, _compat_model(existing, model, existing_default)
+            elif cache_key not in _client_cache:
                 # FIFO safety-belt eviction. Do NOT close evicted clients: another caller may be
                 # mid-request on one; refcount/GC handles it.
                 while len(_client_cache) >= _CLIENT_CACHE_MAX_SIZE:

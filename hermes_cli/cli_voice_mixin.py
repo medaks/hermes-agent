@@ -51,6 +51,38 @@ def _unlink_quietly(path) -> None:
         pass
 
 
+def _ensure_playable_wav(path: str) -> str:
+    """Return a 16 kHz mono WAV for *path*, converting non-WAV audio via ffmpeg.
+
+    The VM loopback playback path is 16 kHz/WAV: an MP3 (e.g. Edge TTS output)
+    falls back to the system player, which opens the loopback at the file's
+    native rate and attenuates the voice ~17x. Returns *path* unchanged when it
+    is already RIFF/WAV or when conversion is unavailable.
+    """
+    try:
+        with open(path, "rb") as fh:
+            if fh.read(4) == b"RIFF":
+                return path
+    except Exception:
+        return path
+    try:
+        import shutil as _shutil
+        import subprocess as _subprocess
+        ffmpeg = _shutil.which("ffmpeg")
+        if not ffmpeg:
+            return path
+        out = path + ".16k.wav"
+        _subprocess.run(
+            [ffmpeg, "-y", "-loglevel", "error", "-i", path,
+             "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", out],
+            timeout=60, check=True)
+        if os.path.isfile(out) and os.path.getsize(out) > 0:
+            return out
+    except Exception:
+        pass
+    return path
+
+
 class CLIVoiceMixin:
     """Voice mode (recording, STT, TTS, full-duplex barge-in) and wake-word listener handlers for the interactive CLI"""
 
@@ -131,6 +163,12 @@ class CLIVoiceMixin:
         # voice.max_recording_seconds — hard cap on one recording; explicit <= 0 disables it.
         _max_rec = _numeric_or(voice_cfg.get("max_recording_seconds"), None)
         rec._max_recording_seconds = (_max_rec if _max_rec > 0 else 0.0) if _max_rec is not None else 120.0
+        # voice.no_speech_timeout — how long to wait for the FIRST speech before
+        # auto-stopping (upstream 15s). Once speech has been heard the stop is
+        # voice.silence_duration of trailing silence, unchanged.
+        _no_speech = _numeric_or(voice_cfg.get("no_speech_timeout"), 15.0)
+        if getattr(rec, "supports_silence_autostop", True):
+            setattr(rec, "_max_wait", _no_speech if _no_speech > 0 else 15.0)
 
         def _on_silence():
             """Called by AudioRecorder when silence is detected after speech."""
@@ -210,7 +248,7 @@ class CLIVoiceMixin:
 
     def _voice_stop_and_transcribe(self):
         """Stop recording, transcribe via STT, and queue the transcript as input."""
-        from cli import _DIM, _RST, _VoiceInputMessage, _cprint
+        from cli import _DIM, _RST, _VoiceInputMessage, _cprint, logger
         # Atomic guard; _voice_processing is set immediately so concurrent Ctrl+B presses
         # don't race into the START path while recorder.stop() holds its lock.
         with self._voice_lock:
@@ -248,12 +286,68 @@ class CLIVoiceMixin:
                     _cprint(f"{_DIM}Stop phrase detected — ending voice chat.{_RST}")
                     self._disable_voice_mode()
                     return
-                self._attached_images.clear()
-                self._voice_invalidate()
-                self._pending_input.put(_VoiceInputMessage(transcript))
-                submitted = True
+                # Continuous-after-wake echo guard (custom): the auto-re-armed mic
+                # can catch the tail of the assistant's own answer (the loopback
+                # hears the speakers through the relay). If the transcript closely
+                # matches what was just spoken, drop it and hand the mic back —
+                # the continuous finally-block re-arms for real speech.
+                _is_echo = False
+                if getattr(self, "_voice_continuous", False):
+                    try:
+                        from tools.voice_mode_transcript import is_tts_echo
+                        _is_echo = is_tts_echo(
+                            transcript, getattr(self, "_voice_last_tts_text", ""))
+                    except Exception:
+                        _is_echo = False
+                if _is_echo:
+                    logger.info("continuous voice: dropped TTS-echo transcript %r", transcript)
+                    _cprint(f"{_DIM}Ignored TTS echo (not queued).{_RST}")
+                else:
+                    self._attached_images.clear()
+                    self._voice_invalidate()
+                    self._pending_input.put(_VoiceInputMessage(transcript))
+                    submitted = True
             elif result.get("success"):
                 _cprint(f"{_DIM}No speech detected.{_RST}")
+                # Custom diagnostics + self-heal: a no-speech capture is either a
+                # dead substream (peak ~0 — the recorder opened while the fed
+                # loopback substream was unavailable), too-low level, or an STT
+                # miss. Log the evidence; on a dead capture drop the recorder so
+                # the next start re-resolves the input device (substream handoff).
+                try:
+                    import array as _array_mod
+                    import wave as _wave_mod
+                    _peak = 0
+                    if wav_path and os.path.isfile(wav_path):
+                        with _wave_mod.open(wav_path, "rb") as _wf:
+                            _raw = _wf.readframes(_wf.getnframes())
+                        if _raw:
+                            _samples = _array_mod.array("h")
+                            _samples.frombytes(_raw)
+                            _peak = max((abs(s) for s in _samples), default=0)
+                    logger.info(
+                        "voice: no-speech wav peak=%d (%s)", _peak,
+                        "DEAF-substream" if _peak <= 40
+                        else "low-level" if _peak < 200 else "audio-but-empty-STT")
+                    if _peak <= 40:
+                        with self._voice_lock:
+                            self._voice_recorder = None  # fresh device open next start
+                    else:
+                        # Preserve STT-empty captures for offline analysis.
+                        try:
+                            import shutil as _shutil_mod
+                            _keep_dir = os.path.expanduser(
+                                "~/.hermes/scratchpad/stt-empty")
+                            os.makedirs(_keep_dir, exist_ok=True)
+                            _shutil_mod.copy2(
+                                wav_path,
+                                os.path.join(
+                                    _keep_dir,
+                                    os.path.basename(wav_path)))
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
             else:
                 _cprint(f"\n{_DIM}Transcription failed: {result.get('error', 'Unknown error')}{_RST}")
                 transcription_failed = True
@@ -274,10 +368,12 @@ class CLIVoiceMixin:
             except Exception:
                 pass
 
-            # Three consecutive no-speech cycles end continuous mode (no infinite restart
-            # loop). While the agent is mid-turn or TTS is speaking the user is CORRECTLY
-            # silent — those cycles must not count, or a multi-minute tool run ends the voice
-            # chat under the user (stop phrase and barge-in still work during the hold).
+            # Consecutive no-speech cycles end continuous mode (no infinite restart
+            # loop). Count configurable via voice.no_speech_cycles (upstream 3; 1 =
+            # a single silent wait ends the chat). While the agent is mid-turn or TTS
+            # is speaking the user is CORRECTLY silent — those cycles must not count,
+            # or a multi-minute tool run ends the voice chat under the user (stop
+            # phrase and barge-in still work during the hold).
             stop_continuous_restart = False
             _tts_done = getattr(self, "_voice_tts_done", None)
             _activity_hold = bool(
@@ -287,10 +383,16 @@ class CLIVoiceMixin:
                 self._no_speech_count = 0
             elif not _activity_hold:
                 self._no_speech_count = getattr(self, '_no_speech_count', 0) + 1
-                if self._no_speech_count >= 3:
+                try:
+                    _cycles = int(_numeric_or(
+                        _config_section("voice").get("no_speech_cycles"), 3) or 3)
+                except Exception:
+                    _cycles = 3
+                _cycles = max(1, _cycles)
+                if self._no_speech_count >= _cycles:
                     self._voice_continuous = False
                     self._no_speech_count = 0
-                    _cprint(f"{_DIM}No speech detected 3 times, continuous mode stopped.{_RST}")
+                    _cprint(f"{_DIM}No speech detected {_cycles} time(s), continuous mode stopped.{_RST}")
                     stop_continuous_restart = True
             # No transcript but continuous mode active: restart so the user can keep talking
             # (when a transcript IS submitted, process_loop restarts after chat()).
@@ -359,11 +461,15 @@ class CLIVoiceMixin:
                 tts_result = {}
             # The tool result is authoritative — chunked long-form output returns several files.
             play_paths = tts_result.get("file_paths") or [tts_result.get("file_path") or mp3_path]
+            _converted: list = []
             for play_path in play_paths if tts_result.get("success") else []:
                 if os.path.isfile(play_path) and os.path.getsize(play_path) > 0:
-                    play_audio_file(play_path)
-            # Clean up all generated files (play_paths + mp3_path + ogg variant)
-            for path in set(play_paths + [mp3_path, mp3_path.rsplit(".", 1)[0] + ".ogg"]):
+                    _playable = _ensure_playable_wav(play_path)
+                    if _playable != play_path:
+                        _converted.append(_playable)
+                    play_audio_file(_playable)
+            # Clean up all generated files (play_paths + mp3_path + ogg variant + conversions)
+            for path in set(play_paths + _converted + [mp3_path, mp3_path.rsplit(".", 1)[0] + ".ogg"]):
                 _unlink_quietly(path)
         except Exception as e:
             logger.warning("Voice TTS playback failed: %s", e)
@@ -747,7 +853,25 @@ class CLIVoiceMixin:
                     self._voice_tts = True
             except Exception:
                 pass
-        self._voice_continuous = False
+        # Continuous-after-wake (custom): when wake_word.continuous is set, a wake
+        # fire arms CONTINUOUS voice — after each answer the mic re-arms so follow-up
+        # questions need no repeated wake phrase. The spoken stop phrase
+        # (voice.stop_phrases) or three silent cycles end it, and the wake detector
+        # re-arms at idle. Default (False) keeps upstream's single-utterance capture.
+        try:
+            _wake_cont = bool(_config_section("wake_word").get("continuous", False))
+        except Exception:
+            _wake_cont = False
+        self._voice_continuous = _wake_cont
+        if _wake_cont:
+            logger.info("wake fire: continuous voice armed (wake_word.continuous=true)")
+            try:
+                _stop_ph = _config_section("voice").get("stop_phrases") or ["stop"]
+                _stop_word = _stop_ph[0] if isinstance(_stop_ph, list) and _stop_ph else "stop"
+            except Exception:
+                _stop_word = "stop"
+            _cprint(f"\n{_DIM}🎤 Continuous conversation armed — keep talking after the "
+                    f"answer; say \"{_stop_word}\" to end.{_RST}")
         try:
             self._voice_start_recording()
         except Exception as e:
@@ -772,6 +896,7 @@ class CLIVoiceMixin:
                         self._agent_running
                         or self._voice_recording
                         or getattr(self, "_voice_processing", False)
+                        or self._voice_continuous  # continuous-after-wake owns the mic
                         or not self._pending_input.empty())
                     if busy:
                         idle_polls = 0

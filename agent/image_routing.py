@@ -168,7 +168,15 @@ def _supports_vision_override(
         provider_matches = declared_provider_l and queried_provider and (
             queried_provider == declared_provider_l
             or queried_provider == declared_provider_l.removeprefix("custom:")
-            or queried_provider == "custom"
+            # The generic runtime identity "custom" is shared by EVERY named custom provider
+            # (they are rewritten to provider="custom" at runtime). It may carry the top-level
+            # flag only when the declaration is not scoped to a DIFFERENT model: a bare
+            # `model.supports_vision` with no declared default still propagates to any model,
+            # but once a default is declared, a session actively running some other model must
+            # not inherit it. Without this guard a text-only named custom provider (e.g.
+            # deepseek) inherited o2's supports_vision: true, claimed native image routing,
+            # and 400'd with "This model does not support image".
+            or (queried_provider == "custom" and not (declared_default and queried_model))
         )
         if not model_matches and not provider_matches:
             # The active model isn't the declared vision-capable one — do not

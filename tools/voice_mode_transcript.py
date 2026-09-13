@@ -56,12 +56,30 @@ def _load_voice_stop_phrases() -> tuple:
     return DEFAULT_VOICE_STOP_PHRASES
 
 
+def _normalize_stop_text(text: str) -> str:
+    """Lowercase, strip ALL punctuation, collapse whitespace."""
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", text or "").lower()).strip()
+
+
 def is_voice_stop_phrase(transcript: str, stop_phrases: Optional[tuple] = None) -> bool:
-    """True when *transcript* is EXACTLY a configured stop phrase. Deliberately strict: the whole
-    utterance — lowercased, surrounding punctuation stripped — must equal a phrase, so "stop doing
-    that and try again" still reaches the agent. ``voice.stop_phrases: []`` disables."""
-    cleaned = transcript.strip().lower().strip(".,!?;: \t\n\"'") if transcript else ""
-    return bool(cleaned) and cleaned in (_load_voice_stop_phrases() if stop_phrases is None else stop_phrases)
+    """True when *transcript* is a configured stop phrase. Punctuation-insensitive: it must
+    either EQUAL a phrase, or BEGIN with one as a whole word in a SHORT utterance
+    ("stop", "stop this conversation now"). Short = at most 5 words, so a longer
+    instruction such as "stop doing that and try again" still reaches the agent.
+    ``voice.stop_phrases: []`` disables."""
+    cleaned = _normalize_stop_text(transcript)
+    if not cleaned:
+        return False
+    phrases = _load_voice_stop_phrases() if stop_phrases is None else stop_phrases
+    for phrase in phrases:
+        p = _normalize_stop_text(str(phrase))
+        if not p:
+            continue
+        if cleaned == p:
+            return True
+        if cleaned.startswith(p + " ") and len(cleaned.split()) <= 5:
+            return True
+    return False
 
 
 # Similarity ratio (difflib.SequenceMatcher) above which a playback-phase barge transcript
