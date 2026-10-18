@@ -1986,8 +1986,14 @@ class TestConcurrentToolExecution:
 
 
 
-    def test_sequential_compress_context_routes_via_invoke_tool(self, agent):
-        """Sequential path must execute compress_context via _invoke_tool."""
+    def test_sequential_compress_context_routes_via_inline_executor(self, agent):
+        """Sequential path must execute compress_context through the agent-level
+        inline executor, carrying the live turn-local messages — never through the
+        registry (``model_tools.handle_function_call``).
+
+        Re-expressed 2026-09-27 on v2026.9.24's structure: upstream replaced the
+        ``agent._invoke_tool`` seam (which this test originally asserted) with
+        ``_resolve_sequential_dispatch`` → ``INLINE_TOOL_EXECUTORS``."""
         tool_call = _mock_tool_call(
             name="compress_context",
             arguments='{"focus_topic":"schema","force":true}',
@@ -1997,19 +2003,21 @@ class TestConcurrentToolExecution:
         messages = []
 
         with (
-            patch.object(agent, "_invoke_tool", return_value='{"success": true}') as mock_invoke,
-            patch("run_agent.handle_function_call", side_effect=AssertionError("should not run")),
+            patch(
+                "tools.compress_context_tool.compress_context_tool",
+                return_value='{"success": true}',
+            ) as mock_tool,
+            patch("model_tools.handle_function_call", side_effect=AssertionError("should not run")),
         ):
             agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
 
-        mock_invoke.assert_called_once_with(
-            "compress_context",
-            {"focus_topic": "schema", "force": True},
-            "task-1",
-            "c1",
-            messages=messages,
-            pre_tool_block_checked=True,
-        )
+        mock_tool.assert_called_once()
+        kwargs = mock_tool.call_args.kwargs
+        assert kwargs["agent"] is agent
+        assert kwargs["messages"] is messages  # live turn-local list, not a copy
+        assert kwargs["task_id"] == "task-1"
+        assert kwargs["focus_topic"] == "schema"
+        assert kwargs["force"] is True
 
     def test_invoke_tool_agent_level_tool_emits_terminal_post_tool_hook(self, agent, monkeypatch):
         """Agent-owned tool paths should close observer tool spans."""
