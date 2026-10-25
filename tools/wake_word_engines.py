@@ -108,6 +108,15 @@ _GATE_DEFAULTS: Dict[str, Any] = {
 }
 
 
+# ONNX model backend (custom): openWakeWord-architecture network exported to
+# ONNX. Same geometry as the pyopen-wakeword TFLite path — 16 embedding
+# windows of 96 features, 80-window history — so a custom model trained on
+# openWakeWord embeddings keeps its scores.
+_ONNX_WINDOWS = 16
+_ONNX_FEATURES = 96
+_ONNX_HISTORY = 80
+
+
 class _OpenWakeWordEngine(_Engine):
     """pyopen-wakeword — free, local hotword detection (TFLite via a bundled
     tensorflowlite_c lib; no runtime download, no framework choice). Scores one
@@ -135,8 +144,40 @@ class _OpenWakeWordEngine(_Engine):
         self._confirm_needed = ww._confirmation_frames(cfg)
         self._confirm_streak = 0
         self._features = OpenWakeWordFeatures.from_builtin()
-        self._model = OpenWakeWord.from_model(model_ref)
-        self._labels = [self._model.id]
+        # Model backend: pyopen-wakeword ships TFLite only, but this
+        # installation's production phrase model is a custom openWakeWord
+        # architecture network exported to ONNX (wake_word.openwakeword.model +
+        # inference_framework: onnx). Keep that backend: the same feature
+        # pipeline (mel + embedding, identical to openWakeWord v0.5.1) feeds an
+        # ONNX session through the same 16x96 sliding window the TFLite path
+        # uses, so scores stay comparable to the pre-v0.22 engine.
+        self._onnx = None
+        self._onnx_input = ""
+        self._onnx_output = ""
+        self._onnx_emb = None
+        self._onnx_new = 0
+        self._model = None
+        _ref_l = str(model_ref).lower()
+        _framework = str(sub.get("inference_framework") or "").lower()
+        if _ref_l.endswith(".onnx") or (_framework == "onnx" and not _looks_like_path(_ref_l)):
+            if not _ref_l.endswith(".onnx"):
+                raise RuntimeError(
+                    f"wake word: openwakeword model {model_ref!r} is not a TFLite "
+                    "model; set wake_word.openwakeword.model to the .onnx model path"
+                )
+            import numpy as _np
+            import onnxruntime as _ort
+
+            self._onnx = _ort.InferenceSession(
+                str(model_ref), providers=["CPUExecutionProvider"]
+            )
+            self._onnx_input = self._onnx.get_inputs()[0].name
+            self._onnx_output = self._onnx.get_outputs()[0].name
+            self._onnx_emb = _np.zeros((_ONNX_HISTORY, _ONNX_FEATURES), dtype=_np.float32)
+            self._labels = [Path(model_ref).stem]
+        else:
+            self._model = OpenWakeWord.from_model(model_ref)
+            self._labels = [self._model.id]
         # Speaker-verification gate (voice-keyed). Fail-closed, disabled by
         # default. When enabled, a rolling buffer of recent audio is kept and,
         # on a phrase fire, the resemblyzer gate confirms the speaker before the
@@ -172,9 +213,14 @@ class _OpenWakeWordEngine(_Engine):
         # the model yields one 0..1 score per completed window.
         over = False
         for emb in self._features.process_streaming(frame.tobytes()):
-            for score in self._model.process_streaming(emb):
-                if score >= self._threshold:
-                    over = True
+            if self._onnx is not None:
+                for score in self._onnx_scores(emb):
+                    if score >= self._threshold:
+                        over = True
+            else:
+                for score in self._model.process_streaming(emb):
+                    if score >= self._threshold:
+                        over = True
         # Require N consecutive over-threshold frames: a real phrase holds the
         # score high across frames, a stray ambient phoneme spikes just one.
         if not over:
@@ -192,13 +238,39 @@ class _OpenWakeWordEngine(_Engine):
             return False
         return True
 
+    def _onnx_scores(self, embeddings):
+        """Slide the 16x96 embedding window and score it with the ONNX model.
+
+        Mirrors pyopen-wakeword's OpenWakeWord.process_streaming precisely (same
+        ring buffer, same window advance), so a custom ONNX model sees exactly
+        the input geometry it was trained on."""
+        import numpy as np
+
+        num = embeddings.shape[2]
+        self._onnx_emb[:-num] = self._onnx_emb[num:]
+        self._onnx_emb[-num:] = embeddings[0, 0, :, :]
+        self._onnx_new = min(len(self._onnx_emb), self._onnx_new + num)
+        while self._onnx_new >= _ONNX_WINDOWS:
+            window = np.zeros((1, _ONNX_WINDOWS, _ONNX_FEATURES), dtype=np.float32)
+            window[0, :] = self._onnx_emb[
+                -self._onnx_new: len(self._onnx_emb) - self._onnx_new + _ONNX_WINDOWS
+            ]
+            self._onnx_new = max(0, self._onnx_new - 1)
+            out = self._onnx.run([self._onnx_output], {self._onnx_input: window})[0]
+            yield float(np.asarray(out).reshape(-1)[0])
+
     def reset(self) -> None:
         # Clears pyopen-wakeword's rolling feature/prediction buffer so stale
         # audio captured before a pause can't re-fire the moment we resume.
         self._confirm_streak = 0
+        if self._onnx is not None:
+            import numpy as np
+            self._onnx_emb = np.zeros((_ONNX_HISTORY, _ONNX_FEATURES), dtype=np.float32)
+            self._onnx_new = 0
         with suppress(Exception):
             self._features.reset()
-            self._model.reset()
+            if self._model is not None:
+                self._model.reset()
 
     def close(self) -> None:
         self.reset()
@@ -207,7 +279,8 @@ class _OpenWakeWordEngine(_Engine):
                 with self._gate_worker_lock:
                     self._kill_gate_worker_locked()
             self._features.close()
-            self._model.close()
+            if self._model is not None:
+                self._model.close()
 
     # ---- Speaker-verification gate internals (fail-closed) ----
 
