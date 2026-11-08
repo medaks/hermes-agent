@@ -254,6 +254,10 @@ def finish_text_response(
         final_response = _join_truncated_parts([*truncated_response_parts, (final_response, False)])
         truncated_response_parts = []
         length_continue_retries = 0
+        # o2-only (custom, ruling #3): a successful continuation clears the
+        # consecutive truncation-hit counter.
+        if getattr(agent, "model", "") == "o2":
+            agent._o2_length_hits = 0
         # The continuation recovered, so the fragments stay in the transcript.
         for _frag in messages:
             if isinstance(_frag, dict):

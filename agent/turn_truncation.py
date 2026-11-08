@@ -44,7 +44,8 @@ _CONTEXT_OVERFLOW_PARTIAL_FINAL = (
 
 def collapse_continuation_trail(
     agent: Any, messages: list[dict[str, Any]], current_turn_user_idx: Any, *,
-    finish_reason: str, parts: Optional[list[str]] = None,
+    finish_reason: str,
+    parts: Optional[list[str] | list[tuple[str, bool]]] = None,
 ) -> str:
     """Drop this turn's ``_length_continuation_fragment``/``_nudge`` rows and append one
     assistant row holding the joined, think-stripped partial; returns that text ("" none).
@@ -322,6 +323,37 @@ def _continue_text(st: _Trunc, _retry: TurnRetryState, assistant_message: Any) -
         interim_msg["_length_continuation_fragment"] = True  # ceiling exit drops these
         append_message(messages, interim_msg)
         st.truncated_response_parts.append((_interim_content, st.is_stub))
+
+    # o2-only (custom, standing ruling #3 — ported onto v0.22.5's turn_truncation
+    # module): a model stuck at its output cap must not burn the whole iteration
+    # budget. Count consecutive finish_reason='length' hits, log the received
+    # text, and stop after 3 with cleanup + persist + partial return.
+    if getattr(agent, "model", "") == "o2":
+        _o2_hits = int(getattr(agent, "_o2_length_hits", 0) or 0) + 1
+        agent._o2_length_hits = _o2_hits
+        if _interim_content:
+            _o2_display = _interim_content[:5000]
+            if len(_interim_content) > 5000:
+                _o2_display += (
+                    f"\n\n[... truncated, first 5000 of {len(_interim_content)} chars shown ...]"
+                )
+            logger.info(
+                "\n\n\n%s⚠️  Response truncated (finish_reason='length') - model hit "
+                "max output tokens\n%s   First 5000 chars of output:\n"
+                "%s   %s\n%s   %s\n%s   %s",
+                agent.log_prefix, agent.log_prefix, agent.log_prefix, "─" * 60,
+                agent.log_prefix, _o2_display, agent.log_prefix, "─" * 60,
+            )
+        if _o2_hits >= 3:
+            _o2_error = f"Model hit output length limit {_o2_hits} consecutive times — stopping"
+            logger.info("\n\n\n%s❌ %s", agent.log_prefix, _o2_error)
+            agent._o2_length_hits = 0
+            agent._ephemeral_reasoning_off = False
+            _o2_partial = collapse_continuation_trail(
+                agent, messages, st.current_turn_user_idx, finish_reason="length",
+                parts=st.truncated_response_parts,
+            )
+            return st.end_turn(_o2_partial or _CEILING_NO_TEXT, _o2_error)
 
     filled = st.window_filled
     if n < 4 and filled is None:
