@@ -468,7 +468,8 @@ from tools.registry import registry, tool_error
 # Disabled — memory tool registration commented out (standing ruling #1: file-based
 # memory only). The agent consults on-disk memory files via read_file using the
 # memory_index.md pointer in the system prompt, rather than through the built-in
-# memory tool. Re-express this disable on upstream's registration shape.
+# memory tool. Upstream's registration shape (compat_args / self_checked_args) is
+# mirrored below so a future re-enable stays faithful to the base.
 # registry.register(
 #     name="memory",
 #     toolset="memory",
@@ -478,4 +479,6 @@ from tools.registry import registry, tool_error
 #         **{k: args.get(k) for k in ("content", "old_text", "new_text", "operations")}),
 #     check_fn=check_memory_requirements,
 #     emoji="🧠",
+#     compat_args=("action", "content", "old_text", "new_text"),
+#     self_checked_args=("target", "operations"),
 #     dynamic_schema_overrides=_build_memory_schema_overrides)
