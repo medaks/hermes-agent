@@ -8,8 +8,8 @@ from .method_ctx import HandlerRegistry, bind_module
 
 _registry = HandlerRegistry()
 # Mirrors ui-tui/src/config/limits.ts INLINE_IMAGE_MAX_COLS/ROWS: no client gets a bigger preview.
-_MAX_PREVIEW_COLS = 64
-_MAX_PREVIEW_ROWS = 16
+_MAX_PREVIEW_COLS = 100
+_MAX_PREVIEW_ROWS = 40
 method = _registry.method
 
 

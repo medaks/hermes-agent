@@ -33,8 +33,8 @@ from agent.terminal_image import (
 
 _INDENT = "  "
 # Mirrors ui-tui/src/config/limits.ts INLINE_IMAGE_MAX_COLS/ROWS (the TUI's budget); keep them equal.
-_MAX_COLS = 64
-_MAX_ROWS = 16
+_MAX_COLS = 100
+_MAX_ROWS = 40
 # Odds per launch of the "VS Code can show full images" hint: occasional, never every start.
 _VSCODE_HINT_ODDS = 0.2
 
